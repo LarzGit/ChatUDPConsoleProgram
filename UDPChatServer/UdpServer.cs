@@ -2,146 +2,162 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using UdpChatServer.Models;
-using System.Text.Json;
-
+using Microsoft.EntityFrameworkCore;
 
 namespace UdpChatServer
 {
-    /// <summary>
-    /// Простой UDP-сервер для обработки входящих сообщений
-    /// </summary>
     public class UdpServer
     {
         private readonly UdpClient _udpClient;
         private readonly Dictionary<string, IPEndPoint> _clients = new Dictionary<string, IPEndPoint>();
-        private ChatHandler _chatHandler;
-
+        private readonly ChatHandler _chatHandler;
+        private readonly DatabaseService _dbService;
 
         public UdpServer(int port)
         {
-            // Открываем сокет на указанном порту для приема UDP-пакетов
             _udpClient = new UdpClient(port);
-            _chatHandler = new ChatHandler(_clients, _udpClient);
-
+            _dbService = new DatabaseService();
+            _chatHandler = new ChatHandler(_clients, _udpClient, _dbService);
+            Console.WriteLine($"UDP-сервер запущено на порту {port}");
         }
 
-        /// <summary>
-        /// Запустить сервер и обрабатывать сообщения бесконечно
-        /// </summary>
         public async Task StartAsync()
         {
             while (true)
             {
-                UdpReceiveResult result = await _udpClient.ReceiveAsync();
-                string message = Encoding.UTF8.GetString(result.Buffer);
-                IPEndPoint remoteEP = result.RemoteEndPoint;
-
-                Console.WriteLine($"Получено от {remoteEP}: {message}");
-
+                IPEndPoint remoteEP = null;
                 try
                 {
-                    // 1️⃣ Получаем текст и определяем тип запроса
-                    string json = Encoding.UTF8.GetString(result.Buffer);
-                    Console.WriteLine($"Получено от {remoteEP}: {json}");
-
-                    using var db = new AppDbContext();
-                    var doc = JsonDocument.Parse(json);
+                    var result = await _udpClient.ReceiveAsync();
+                    remoteEP = result.RemoteEndPoint;
+                    string message = Encoding.UTF8.GetString(result.Buffer);
+                    Console.WriteLine($"Отримано від {remoteEP}: {message}");
+                    using var doc = JsonDocument.Parse(message);
                     var type = doc.RootElement.GetProperty("Type").GetString();
-
-                    // 2️⃣ Обработка разных типов команд
-                    if (type == "Register")
+                    switch (type)
                     {
-                        var data = JsonSerializer.Deserialize<RegisterRequest>(json);
-                        var existing = db.Users.FirstOrDefault(u => u.Login == data.Login);
-                        if (existing != null)
-                        {
-                            await SendResponse("RegisterResult", "Fail", "Логин уже занят", remoteEP);
-                            continue;
-                        }
-
-                        PasswordHelper.HashPassword(data.Password, out var salt, out var hash);
-                        var user = new User { Login = data.Login, Salt = salt, PasswordHash = hash, IsOnline = false };
-                        db.Users.Add(user);
-                        db.SaveChanges();
-
-                        await SendResponse("RegisterResult", "Success", "Регистрация выполнена", remoteEP);
+                        case "Register":
+                            var regReq = JsonSerializer.Deserialize<RegisterRequest>(message);
+                            var (ok, msg) = await _dbService.RegisterUserAsync(regReq);
+                            await SendResponse("RegisterResult", ok ? "Success" : "Fail", msg, remoteEP);
+                            break;
+                        case "Login":
+                            var loginReq = JsonSerializer.Deserialize<LoginRequest>(message);
+                            var user = await _dbService.LoginUserAsync(loginReq.Login, loginReq.Password);
+                            if (user == null)
+                            {
+                                await SendResponse("LoginResult", "Fail", "Невірний логін або пароль", remoteEP);
+                            }
+                            else
+                            {
+                                _clients[loginReq.Login] = remoteEP;
+                                Console.WriteLine($"Online users: {string.Join(", ", _clients.Keys)}");
+                                await SendResponse("LoginResult", "Success", "Вхід успішний", remoteEP);
+                                await _chatHandler.NotifyContactsOnline(loginReq.Login);
+                            }
+                            break;
+                        case "Logout":
+                            var logoutReq = JsonSerializer.Deserialize<LoginRequest>(message);
+                            await _dbService.LogoutUserAsync(logoutReq.Login);
+                            _clients.Remove(logoutReq.Login);
+                            Console.WriteLine($"Online users: {string.Join(", ", _clients.Keys)}");
+                            await _chatHandler.NotifyContactsOffline(logoutReq.Login);
+                            await SendResponse("LogoutResult", "Success", "Вихід виконано", remoteEP);
+                            break;
+                        case "AddContact":
+                            var addReq = JsonSerializer.Deserialize<ContactRequest>(message);
+                            Console.WriteLine($"Processing AddContact for {addReq.OwnerLogin} -> {addReq.ContactLogin}");
+                            var addRes = await _dbService.AddContactAsync(addReq.OwnerLogin, addReq.ContactLogin);
+                            await SendResponse("AddContactResult", addRes.Success ? "Success" : "Fail", addRes.Message, remoteEP);
+                            break;
+                        case "RemoveContact":
+                            var remReq = JsonSerializer.Deserialize<ContactRequest>(message);
+                            Console.WriteLine($"Processing RemoveContact for {remReq.OwnerLogin} -> {remReq.ContactLogin}");
+                            var remRes = await _dbService.RemoveContactAsync(remReq.OwnerLogin, remReq.ContactLogin);
+                            await SendResponse("RemoveContactResult", remRes.Success ? "Success" : "Fail", remRes.Message, remoteEP);
+                            break;
+                        case "GetContacts":
+                            var getReq = JsonSerializer.Deserialize<ContactRequest>(message);
+                            Console.WriteLine($"Processing GetContacts for {getReq.OwnerLogin}");
+                            var contacts = await _dbService.GetContactsAsync(getReq.OwnerLogin);
+                            await SendResponse("GetContactsResult", "Success", "", remoteEP, new { Contacts = contacts });
+                            break;
+                        case "GetBlacklist": // Нова обробка
+                            var blackReq = JsonSerializer.Deserialize<ContactRequest>(message);
+                            Console.WriteLine($"Processing GetBlacklist for {blackReq.OwnerLogin}");
+                            var blacklist = await _dbService.GetBlackListAsync(blackReq.OwnerLogin);
+                            await SendResponse("GetBlacklistResult", "Success", "", remoteEP, new { Blacklist = blacklist });
+                            break;
+                        case "GetHistory":
+                            var messages = await _dbService.GetAllMessagesAsync();
+                            var history = new
+                            {
+                                Messages = messages.Take(100).Select(async m => new
+                                {
+                                    From = (await _dbService.GetUserByIdAsync(m.SenderId))?.Login ?? "Unknown",
+                                    Content = m.Content,
+                                    Timestamp = m.Timestamp
+                                }).Select(t => t.Result).ToList()
+                            };
+                            await SendResponse("HistoryResult", "Success", "", remoteEP, history);
+                            break;
+                        default:
+                            await _chatHandler.HandleIncomingMessage(message, remoteEP);
+                            break;
                     }
-                    else if (type == "Login")
-                    {
-                        var data = JsonSerializer.Deserialize<LoginRequest>(json);
-                        var user = db.Users.FirstOrDefault(u => u.Login == data.Login);
-                        if (user == null || !PasswordHelper.VerifyPassword(data.Password, user.Salt, user.PasswordHash))
-                        {
-                            await SendResponse("LoginResult", "Fail", "Неверный логин или пароль", remoteEP);
-                            continue;
-                        }
-
-                        user.IsOnline = true;
-                        db.LogEntries.Add(new LogEntry { UserId = user.Id, Event = "Login", Timestamp = DateTime.Now });
-                        db.SaveChanges();
-
-                        _clients[remoteEP.ToString()] = remoteEP;
-                        await SendResponse("LoginResult", "Success", "Вход выполнен", remoteEP);
-                        // Оповещаем контакты, что пользователь вошёл
-                        await _chatHandler.NotifyContactsOnline(user.Login);
-                    }
-                    else if (type == "AddContact")
-                    {
-                        var data = JsonSerializer.Deserialize<ContactRequest>(json);
-                        var owner = db.Users.FirstOrDefault(u => u.Login == data.OwnerLogin);
-                        var contact = db.Users.FirstOrDefault(u => u.Login == data.ContactLogin);
-                        if (owner == null || contact == null)
-                        {
-                            await SendResponse("AddContactResult", "Fail", "Пользователь не найден", remoteEP);
-                            continue;
-                        }
-
-                        db.Contacts.Add(new Contact { OwnerId = owner.Id, ContactUserId = contact.Id });
-                        db.SaveChanges();
-                        await SendResponse("AddContactResult", "Success", "Контакт добавлен", remoteEP);
-                    }
-                    else if (type == "RemoveContact")
-                    {
-                        var data = JsonSerializer.Deserialize<ContactRequest>(json);
-                        var owner = db.Users.FirstOrDefault(u => u.Login == data.OwnerLogin);
-                        var contact = db.Users.FirstOrDefault(u => u.Login == data.ContactLogin);
-                        var link = db.Contacts.FirstOrDefault(c => c.OwnerId == owner.Id && c.ContactUserId == contact.Id);
-
-                        if (link != null)
-                        {
-                            db.Contacts.Remove(link);
-                            db.SaveChanges();
-                            await SendResponse("RemoveContactResult", "Success", "Контакт удалён", remoteEP);
-                        }
-                        else
-                        {
-                            await SendResponse("RemoveContactResult", "Fail", "Контакт не найден", remoteEP);
-                        }
-                    }
-                    else
-                    {
-                        // Передаём остальные команды (этапы 5–7) в отдельный обработчик ChatHandler
-                        await _chatHandler.HandleIncomingMessage(message, remoteEP);
-                    }
-
+                }
+                catch (SocketException ex)
+                {
+                    Console.WriteLine($"UDP помилка: {ex.Message}");
+                    if (remoteEP != null)
+                        await SendResponse("Error", "Fail", "Сервер перевантажений", remoteEP);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Ошибка обработки пакета: {ex.Message}");
-                    await SendResponse("Error", "Fail", "Ошибка на сервере", result.RemoteEndPoint);
+                    Console.WriteLine($"Помилка обробки пакету: {ex.Message}");
+                    if (ex.InnerException != null)
+                        Console.WriteLine($"Inner exception: {ex.InnerException.Message}");
+                    if (remoteEP != null)
+                        await SendResponse("Error", "Fail", "Помилка на сервері", remoteEP);
                 }
             }
-
         }
 
-        private async Task SendResponse(string type, string status, string message, IPEndPoint remoteEP)
+        private async Task SendResponse(string type, string status, string message, IPEndPoint remoteEP, object data = null)
         {
-            var res = new JsonResponse { Type = type, Status = status, Message = message };
+            var res = new { Type = type, Status = status, Message = message, Data = data };
             var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
             await _udpClient.SendAsync(bytes, bytes.Length, remoteEP);
         }
+    }
+
+    public class ContactRequest
+    {
+        public string Type { get; set; }
+        public string OwnerLogin { get; set; }
+        public string ContactLogin { get; set; }
+    }
+
+    public class LoginRequest
+    {
+        public string Type { get; set; }
+        public string Login { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class RegisterRequest
+    {
+        public string Type { get; set; }
+        public string Login { get; set; }
+        public string Email { get; set; }
+        public string Name { get; set; }
+        public string Surname { get; set; }
+        public string Password { get; set; }
+        public string PasswordConfirm { get; set; }
+        public DateTime? Birthday { get; set; }
     }
 }

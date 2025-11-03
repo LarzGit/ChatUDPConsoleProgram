@@ -1,287 +1,131 @@
-﻿// Фрагмент кода для этапов 5–7
-using Microsoft.EntityFrameworkCore;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using UdpChatServer;
+using System.Threading.Tasks;
 using UdpChatServer.Models;
 
-public class ChatHandler
+namespace UdpChatServer
 {
-    private readonly Dictionary<string, IPEndPoint> _onlineUsers;
-    private readonly UdpClient _udpClient;
-
-    public ChatHandler(Dictionary<string, IPEndPoint> onlineUsers, UdpClient udpClient)
+    public class ChatHandler
     {
-        _onlineUsers = onlineUsers;
-        _udpClient = udpClient;
-    }
+        private readonly Dictionary<string, IPEndPoint> _clients;
+        private readonly UdpClient _udpClient;
+        private readonly DatabaseService _dbService;
 
-    public async Task HandleIncomingMessage(string json, IPEndPoint senderEndPoint)
-    {
-        var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        if (!root.TryGetProperty("Type", out var typeProp)) return;
-
-        string type = typeProp.GetString();
-
-        switch (type)
+        public ChatHandler(Dictionary<string, IPEndPoint> clients, UdpClient udpClient, DatabaseService dbService)
         {
-            case "SendMessage":
-                await HandleSendMessage(root, senderEndPoint);
-                break;
-
-            case "GetHistory":
-                await HandleGetHistory(root, senderEndPoint);
-                break;
-
-            // 🟢 Добавь вот эти два case:
-            case "SearchContacts":
-                await HandleSearchContacts(root, senderEndPoint);
-                break;
-
-            case "SearchMessages":
-                await HandleSearchMessages(root, senderEndPoint);
-                break;
+            _clients = clients;
+            _udpClient = udpClient;
+            _dbService = dbService;
         }
-    }
 
-
-    private async Task HandleSendMessage(JsonElement root, IPEndPoint senderEP)
-    {
-        var login = root.GetProperty("SenderLogin").GetString();
-        var recipients = root.GetProperty("Recipients").EnumerateArray().Select(x => x.GetString()).ToList();
-        var text = root.GetProperty("Text").GetString();
-        var timestamp = root.GetProperty("Timestamp").GetDateTime();
-
-        using var db = new AppDbContext();
-
-        var senderUser = await db.Users.FirstOrDefaultAsync(u => u.Login == login);
-        if (senderUser == null || !_onlineUsers.ContainsKey(login)) return;
-
-        foreach (var rec in recipients)
+        public async Task HandleIncomingMessage(string message, IPEndPoint senderEP)
         {
-            if (rec == "Group")
+            try
             {
-                var groupRecipients = db.Users.Where(u => u.Login != login).ToList();
-                foreach (var u in groupRecipients)
+                using var doc = JsonDocument.Parse(message);
+                var type = doc.RootElement.GetProperty("Type").GetString();
+                if (type == "SendMessage")
                 {
-                    if (!_onlineUsers.ContainsKey(u.Login)) continue;
-                    if (IsBlocked(db, senderUser.Id, u.Id)) continue;
+                    var msg = JsonSerializer.Deserialize<ChatMessage>(message);
+                    if (msg == null || string.IsNullOrWhiteSpace(msg.Text)) return;
 
-                    await SendMessagePacket(u.Login, login, text, timestamp);
-                    db.Messages.Add(new Message
+                    var sender = await _dbService.GetUserByLoginAsync(msg.SenderLogin);
+                    if (sender == null) return;
+
+                    var timestamp = DateTime.UtcNow;
+                    await _dbService.AddMessageAsync(sender.Id, 0, msg.Text, timestamp); // 0 для групового чату
+
+                    var notification = new
                     {
-                        SenderId = senderUser.Id,
-                        ReceiverId = u.Id,
-                        Content = text,
+                        Type = "ReceiveMessage",
+                        From = msg.SenderLogin,
+                        Text = msg.Text,
                         Timestamp = timestamp
-                    });
+                    };
+
+                    var json = JsonSerializer.Serialize(notification);
+                    var data = Encoding.UTF8.GetBytes(json);
+
+                    foreach (var client in _clients)
+                    {
+                        if (client.Key != msg.SenderLogin) // Не відправляти самому собі
+                        {
+                            await _udpClient.SendAsync(data, data.Length, client.Value);
+                        }
+                    }
                 }
             }
-            else
+            catch (Exception ex)
             {
-                var receiver = db.Users.FirstOrDefault(u => u.Login == rec);
-                if (receiver == null || !_onlineUsers.ContainsKey(rec)) continue;
-                if (IsBlocked(db, senderUser.Id, receiver.Id)) continue;
-
-                await SendMessagePacket(rec, login, text, timestamp);
-                db.Messages.Add(new Message
-                {
-                    SenderId = senderUser.Id,
-                    ReceiverId = receiver.Id,
-                    Content = text,
-                    Timestamp = timestamp
-                });
+                Console.WriteLine($"Помилка обробки повідомлення: {ex.Message}");
             }
         }
 
-        await db.SaveChangesAsync();
-    }
-
-    private async Task SendMessagePacket(string recipientLogin, string senderLogin, string text, DateTime timestamp)
-    {
-        var packet = new
+        public async Task NotifyContactsOnline(string login)
         {
-            Type = "ReceiveMessage",
-            From = senderLogin,
-            Text = text,
-            Timestamp = timestamp
-        };
-        var json = JsonSerializer.Serialize(packet);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await _udpClient.SendAsync(bytes, bytes.Length, _onlineUsers[recipientLogin]);
-    }
+            try
+            {
+                var user = await _dbService.GetUserByLoginAsync(login);
+                if (user == null) return;
 
-    private async Task HandleGetHistory(JsonElement root, IPEndPoint senderEP)
-    {
-        var login = root.GetProperty("SenderLogin").GetString();
-        var contactLogin = root.TryGetProperty("ContactLogin", out var c) ? c.GetString() : null;
+                var contacts = await _dbService.GetContactsAsync(login);
+                var notification = new { Type = "UserOnline", Login = login };
 
-        using var db = new AppDbContext();
-        var sender = db.Users.FirstOrDefault(u => u.Login == login);
-        if (sender == null) return;
+                var json = JsonSerializer.Serialize(notification);
+                var data = Encoding.UTF8.GetBytes(json);
 
-        List<Message> messages;
-
-        if (!string.IsNullOrEmpty(contactLogin))
-        {
-            var contact = db.Users.FirstOrDefault(u => u.Login == contactLogin);
-            if (contact == null) return;
-
-            messages = db.Messages.Where(m =>
-                (m.SenderId == sender.Id && m.ReceiverId == contact.Id) ||
-                (m.SenderId == contact.Id && m.ReceiverId == sender.Id))
-                .OrderBy(m => m.Timestamp)
-                .ToList();
-        }
-        else
-        {
-            messages = db.Messages.Where(m => m.SenderId == sender.Id || m.ReceiverId == sender.Id)
-                .OrderBy(m => m.Timestamp).ToList();
+                foreach (var contactLogin in contacts)
+                {
+                    if (_clients.TryGetValue(contactLogin, out var ep))
+                    {
+                        await _udpClient.SendAsync(data, data.Length, ep);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Помилка сповіщення про онлайн: {ex.Message}");
+            }
         }
 
-        var result = messages.Select(m => new
+        public async Task NotifyContactsOffline(string login)
         {
-            From = db.Users.Find(m.SenderId)?.Login,
-            To = db.Users.Find(m.ReceiverId)?.Login,
-            m.Content,
-            m.Timestamp
-        });
+            try
+            {
+                var user = await _dbService.GetUserByLoginAsync(login);
+                if (user == null) return;
 
-        var packet = new
-        {
-            Type = "HistoryResult",
-            Messages = result
-        };
+                var contacts = await _dbService.GetContactsAsync(login);
+                var notification = new { Type = "UserOffline", Login = login };
 
-        var json = JsonSerializer.Serialize(packet);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await _udpClient.SendAsync(bytes, bytes.Length, senderEP);
-    }
+                var json = JsonSerializer.Serialize(notification);
+                var data = Encoding.UTF8.GetBytes(json);
 
-    private bool IsBlocked(AppDbContext db, int senderId, int receiverId)
-    {
-        return db.BlacklistEntries.Any(b =>
-            (b.OwnerId == senderId && b.BlockedUserId == receiverId) ||
-            (b.OwnerId == receiverId && b.BlockedUserId == senderId));
-    }
-
-    public async Task NotifyContactsOnline(string login)
-    {
-        using var db = new AppDbContext();
-        var user = db.Users.FirstOrDefault(u => u.Login == login);
-        if (user == null) return;
-
-        var contacts = db.Contacts.Where(c => c.OwnerId == user.Id).Select(c => c.ContactUserId).ToList();
-        foreach (var contactId in contacts)
-        {
-            var contactUser = db.Users.Find(contactId);
-            if (contactUser == null || !_onlineUsers.ContainsKey(contactUser.Login)) continue;
-            if (IsBlocked(db, user.Id, contactUser.Id)) continue;
-
-            var packet = new { Type = "UserOnline", Login = login };
-            var json = JsonSerializer.Serialize(packet);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await _udpClient.SendAsync(bytes, bytes.Length, _onlineUsers[contactUser.Login]);
+                foreach (var contactLogin in contacts)
+                {
+                    if (_clients.TryGetValue(contactLogin, out var ep))
+                    {
+                        await _udpClient.SendAsync(data, data.Length, ep);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Помилка сповіщення про офлайн: {ex.Message}");
+            }
         }
-
-        db.LogEntries.Add(new LogEntry { UserId = user.Id, Event = "Login", Timestamp = DateTime.UtcNow });
-        db.SaveChanges();
     }
 
-    public async Task NotifyContactsOffline(string login)
+    public class ChatMessage
     {
-        using var db = new AppDbContext();
-        var user = db.Users.FirstOrDefault(u => u.Login == login);
-        if (user == null) return;
-
-        var contacts = db.Contacts.Where(c => c.OwnerId == user.Id).Select(c => c.ContactUserId).ToList();
-        foreach (var contactId in contacts)
-        {
-            var contactUser = db.Users.Find(contactId);
-            if (contactUser == null || !_onlineUsers.ContainsKey(contactUser.Login)) continue;
-            if (IsBlocked(db, user.Id, contactUser.Id)) continue;
-
-            var packet = new { Type = "UserOffline", Login = login };
-            var json = JsonSerializer.Serialize(packet);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await _udpClient.SendAsync(bytes, bytes.Length, _onlineUsers[contactUser.Login]);
-        }
-
-        db.LogEntries.Add(new LogEntry { UserId = user.Id, Event = "Logout", Timestamp = DateTime.UtcNow });
-        db.SaveChanges();
+        public string Type { get; set; }
+        public string SenderLogin { get; set; }
+        public string Text { get; set; }
+        public DateTime Timestamp { get; set; }
     }
-
-    private async Task HandleSearchContacts(JsonElement root, IPEndPoint senderEP)
-    {
-        // Получаем поисковую строку из запроса
-        var query = root.GetProperty("Query").GetString();
-        using var db = new AppDbContext();
-
-        // Ищем все пользователи, у которых логин содержит подстроку query (LINQ Contains поддерживается EF Core:contentReference[oaicite:0]{index=0})
-        var results = db.Users
-                        .Where(u => u.Login.Contains(query))
-                        .Select(u => u.Login)
-                        .ToList();
-
-        // Формируем JSON-ответ с найденными логинами
-        var response = new
-        {
-            Type = "SearchContactsResult",
-            Results = results  // список строковых логинов
-        };
-        var json = JsonSerializer.Serialize(response);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await _udpClient.SendAsync(bytes, bytes.Length, senderEP);
-    }
-
-    private async Task HandleSearchMessages(JsonElement root, IPEndPoint senderEP)
-    {
-        // Получаем поисковую строку и (опционально) логин отправителя
-        var query = root.GetProperty("Query").GetString();
-        var senderLogin = root.TryGetProperty("SenderLogin", out var sl) ? sl.GetString() : null;
-        using var db = new AppDbContext();
-
-        List<Message> messages;
-        if (!string.IsNullOrEmpty(senderLogin))
-        {
-            // Ищем пользователя-отправителя
-            var sender = db.Users.FirstOrDefault(u => u.Login == senderLogin);
-            if (sender == null) return; // отправитель не найден
-                                        // Фильтр: только сообщения от этого пользователя, содержащие query
-            messages = db.Messages
-                         .Where(m => m.SenderId == sender.Id && m.Content.Contains(query))
-                         .OrderBy(m => m.Timestamp)
-                         .ToList();
-        }
-        else
-        {
-            // Если SenderLogin не указан – ищем по всем сообщениям
-            messages = db.Messages
-                         .Where(m => m.Content.Contains(query))
-                         .OrderBy(m => m.Timestamp)
-                         .ToList();
-        }
-
-        // Формируем результат: перечисляем найденные сообщения
-        var results = messages.Select(m => new
-        {
-            From = db.Users.Find(m.SenderId)?.Login,
-            Text = m.Content,
-            Timestamp = m.Timestamp
-        }).ToList();
-
-        var response = new
-        {
-            Type = "SearchMessagesResult",
-            Messages = results  // список сообщений с полями From, Text, Timestamp
-        };
-        var json = JsonSerializer.Serialize(response);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await _udpClient.SendAsync(bytes, bytes.Length, senderEP);
-    }
-
 }

@@ -1,8 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace UdpChatServer.Models
 {
@@ -10,9 +6,13 @@ namespace UdpChatServer.Models
     {
         public string Type { get; set; }
         public string Login { get; set; }
+        public string Email { get; set; }      // нове
+        public string Name { get; set; }       // нове
+        public string Surname { get; set; }    // нове
         public string Password { get; set; }
+        public string PasswordConfirm { get; set; } // нове
+        public DateTime? Birthday { get; set; }     // нове
     }
-
 
     public class LoginRequest
     {
@@ -21,7 +21,6 @@ namespace UdpChatServer.Models
         public string Password { get; set; }
     }
 
-
     public class ContactRequest
     {
         public string Type { get; set; }
@@ -29,11 +28,11 @@ namespace UdpChatServer.Models
         public string ContactLogin { get; set; }
     }
 
-
     public class JsonResponse
     {
         public string Type { get; set; }
-        public string Status { get; set; }
+        public string Status { get; set; } // "Success" / "Fail"
         public string Message { get; set; }
+        public object Data { get; set; }   // додаткові дані (опціонально)
     }
 }

@@ -1,6 +1,6 @@
-﻿using System.Security.Cryptography;
+﻿using System;
+using System.Security.Cryptography;
 using System.Text;
-
 
 namespace UdpChatServer
 {
@@ -8,32 +8,34 @@ namespace UdpChatServer
     {
         public static void HashPassword(string password, out string salt, out string hash)
         {
-            byte[] saltBytes = RandomNumberGenerator.GetBytes(16);
-            byte[] hashBytes = Rfc2898DeriveBytes.Pbkdf2(
-            Encoding.UTF8.GetBytes(password),
-            saltBytes,
-            100000,
-            HashAlgorithmName.SHA512,
-            32);
-
-
+            // Генеруємо соль
+            byte[] saltBytes = new byte[16];
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(saltBytes);
+            }
             salt = Convert.ToBase64String(saltBytes);
-            hash = Convert.ToBase64String(hashBytes);
+
+            // Використовуємо PBKDF2
+            using var derive = new Rfc2898DeriveBytes(password, saltBytes, 100_000, HashAlgorithmName.SHA256);
+            var key = derive.GetBytes(32);
+            hash = Convert.ToBase64String(key);
         }
 
-
-        public static bool VerifyPassword(string password, string storedSalt, string storedHash)
+        public static bool VerifyPassword(string password, string salt, string storedHash)
         {
-            byte[] saltBytes = Convert.FromBase64String(storedSalt);
-            byte[] hashBytes = Rfc2898DeriveBytes.Pbkdf2(
-            Encoding.UTF8.GetBytes(password),
-            saltBytes,
-            100000,
-            HashAlgorithmName.SHA512,
-            32);
-
-
-            return Convert.ToBase64String(hashBytes) == storedHash;
+            try
+            {
+                var saltBytes = Convert.FromBase64String(salt);
+                using var derive = new Rfc2898DeriveBytes(password, saltBytes, 100_000, HashAlgorithmName.SHA256);
+                var key = derive.GetBytes(32);
+                var hash = Convert.ToBase64String(key);
+                return hash == storedHash;
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 }
